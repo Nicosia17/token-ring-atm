@@ -1,0 +1,315 @@
+import socket
+import threading
+import sys
+import time
+import os
+import queue
+from datetime import datetime
+from config import (NODES, INITIAL_BALANCE, BALANCE_FILE,
+                    RETRY_DELAY, MAX_RETRIES, TOKEN_PAUSE, SILENT_MODE)
+
+log_lock = threading.Lock()
+
+def log(my_id, message):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}][ATM{my_id}] {message}"
+    with open(f"atm{my_id}.log", "a") as f:
+        f.write(line + "\n")
+    if not SILENT_MODE:
+        with log_lock:
+            print(line)
+
+def notify(my_id, message):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}][ATM{my_id}] {message}"
+    with log_lock:
+        print(line)
+    with open(f"atm{my_id}.log", "a") as f:
+        f.write(line + "\n")
+
+def init_balance(my_id):
+    if not os.path.exists(BALANCE_FILE):
+        with open(BALANCE_FILE, "w") as f:
+            f.write(str(INITIAL_BALANCE))
+        notify(my_id, f"💳 Saldo iniziale creato: {INITIAL_BALANCE}€")
+
+def read_balance():
+    with open(BALANCE_FILE, "r") as f:
+        return int(f.read().strip())
+
+def write_balance(amount):
+    with open(BALANCE_FILE, "w") as f:
+        f.write(str(amount))
+
+def show_history(my_id):
+    log_file = f"atm{my_id}.log"
+    if not os.path.exists(log_file):
+        notify(my_id, "Nessun log disponibile ancora.")
+        return
+    with open(log_file, "r") as f:
+        lines = f.readlines()
+    transazioni = []
+    blocco_corrente = None
+    for line in lines:
+        line = line.strip()
+        if "INIZIO TRANSAZIONE" in line:
+            try:
+                tx_id = line.split("INIZIO TRANSAZIONE")[1].strip().replace("══", "").strip()
+            except:
+                tx_id = "TX-???"
+            blocco_corrente = {"id": tx_id, "atm": f"ATM{my_id}", "lines": []}
+        elif "FINE TRANSAZIONE" in line and blocco_corrente is not None:
+            transazioni.append(blocco_corrente)
+            blocco_corrente = None
+        elif blocco_corrente is not None:
+            keywords = ["ATM", "Operazione", "Saldo prima", "Saldo dopo", "insufficiente"]
+            if any(k in line for k in keywords):
+                try:
+                    content = line.split("]", 2)[-1].strip()
+                except:
+                    content = line
+                blocco_corrente["lines"].append(content)
+    passaggi_vuoti = [l.strip() for l in lines if "Nessuna operazione in coda" in l]
+    with log_lock:
+        print(f"\n  ╔══════════════════════════════════════════════╗")
+        print(f"  ║        ATM{my_id} — Storico Movimenti              ║")
+        print(f"  ╚══════════════════════════════════════════════╝")
+        if not transazioni:
+            print(f"  Nessuna transazione eseguita ancora su ATM{my_id}.")
+        else:
+            for tx in transazioni:
+                print(f"\n  ┌─ {tx['id']} — {tx['atm']} {'─' * 28}")
+                for detail in tx["lines"]:
+                    print(f"  │  {detail}")
+                print(f"  └{'─' * 45}")
+        print(f"\n  📋 Riepilogo:")
+        print(f"     • Transazioni completate : {len(transazioni)}")
+        print(f"     • Passaggi senza azione  : {len(passaggi_vuoti)}")
+        print(f"     • Token ricevuti totali  : {len(transazioni) + len(passaggi_vuoti)}")
+        print(f"\n  ╔══════════════════════════════════════════════╗")
+        print(f"  ║Saldo attuale: {read_balance()}€{' ' * (30 - len(str(read_balance())))} ║")
+        print(f"  ╚══════════════════════════════════════════════╝")
+
+pending_operations = queue.Queue()
+token_busy = threading.Event()
+
+tx_counter = 0
+tx_lock = threading.Lock()
+
+def execute_transaction(my_id):
+    global tx_counter
+    if pending_operations.empty():
+        log(my_id, "Nessuna operazione in coda → passo il token.")
+        return
+    operation, amount = pending_operations.get()
+    with tx_lock:
+        tx_counter += 1
+        tx_id = f"TX-{tx_counter:03d}"
+    balance = read_balance()
+    log(my_id, f"══ INIZIO TRANSAZIONE {tx_id} ══")
+    log(my_id, f"ID          : {tx_id}")
+    log(my_id, f"ATM         : ATM{my_id}")
+    log(my_id, f"Operazione  : {operation.upper()} di {amount}€")
+    log(my_id, f"Saldo prima : {balance}€")
+    if operation == "prelievo":
+        if amount > balance:
+            notify(my_id, f"❌ [{tx_id}] Saldo insufficiente ({balance}€ disponibili). Operazione annullata.")
+            log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
+            return
+        new_balance = balance - amount
+    elif operation == "deposito":
+        new_balance = balance + amount
+    else:
+        log(my_id, f"Operazione sconosciuta: {operation}. Annullata.")
+        return
+    write_balance(new_balance)
+    log(my_id, f"Saldo dopo  : {new_balance}€")
+    log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
+    notify(my_id, f"✅ [{tx_id}] {operation.upper()} di {amount}€ su ATM{my_id} completato! Nuovo saldo: {new_balance}€")
+
+running = True
+ready_nodes = set()
+ready_lock = threading.Lock()
+all_ready_event = threading.Event()
+
+def get_successor_id(my_id):
+    return (my_id % 4) + 1
+
+def send_message(my_id, target_id, message):
+    host, port = NODES[target_id]
+    for attempt in range(MAX_RETRIES):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(3)
+                s.connect((host, port))
+                s.sendall(message.encode())
+            log(my_id, f">> Inviato ad ATM{target_id}: '{message}'")
+            return True
+        except (ConnectionRefusedError, socket.timeout):
+            if attempt < MAX_RETRIES - 1:
+                log(my_id, f"ATM{target_id} non risponde, riprovo ({attempt+1}/{MAX_RETRIES})...")
+                time.sleep(RETRY_DELAY)
+    log(my_id, f"Impossibile raggiungere ATM{target_id} dopo {MAX_RETRIES} tentativi.")
+    return False
+
+def handle_message(my_id, message):
+    global running
+    if message.startswith("READY"):
+        _, sender_id = message.split(":")
+        sender_id = int(sender_id)
+        with ready_lock:
+            ready_nodes.add(sender_id)
+            log(my_id, f"ATM{sender_id} è pronto ({len(ready_nodes)}/3)")
+            if ready_nodes == {2, 3, 4}:
+                log(my_id, "Tutti e 4 i nodi sono pronti!")
+                all_ready_event.set()
+    elif message.startswith("TOKEN"):
+        _, round_num = message.split(":")
+        round_num = int(round_num)
+        if not all_ready_event.is_set():
+            all_ready_event.set()
+        token_busy.set()
+        log(my_id, f"★ TOKEN RICEVUTO — round {round_num}")
+        if not pending_operations.empty():
+            notify(my_id, "🔑 Token ricevuto — eseguo la tua operazione...")
+        execute_transaction(my_id)
+        successor = get_successor_id(my_id)
+        next_round = round_num + 1 if my_id == 4 else round_num
+        time.sleep(TOKEN_PAUSE)
+        log(my_id, f">> Passo il token ad ATM{successor} (round {next_round})")
+        token_busy.clear()
+        send_message(my_id, successor, f"TOKEN:{next_round}")
+    elif message == "STOP":
+        log(my_id, "STOP ricevuto — il sistema si ferma.")
+        notify(my_id, "🛑 Sistema fermato.")
+        running = False
+        token_busy.clear()
+        successor = get_successor_id(my_id)
+        if my_id != 1:
+            send_message(my_id, successor, "STOP")
+
+def user_menu(my_id, ready_event):
+    ready_event.wait()
+    time.sleep(1.0)
+    notify(my_id, "✅ Sistema pronto! Puoi operare.")
+    while running:
+        while token_busy.is_set():
+            time.sleep(0.1)
+        with log_lock:
+            print(f"\n  ╔══════════════════════════════════╗")
+            print(f"  ║         ATM{my_id} — Menu              ║")
+            print(f"  ╠══════════════════════════════════╣")
+            print(f"  ║  1. Visualizza saldo             ║")
+            print(f"  ║  2. Deposita                     ║")
+            print(f"  ║  3. Preleva                      ║")
+            print(f"  ║  4. Storico movimenti            ║")
+            print(f"  ║  5. Esci                         ║")
+            print(f"  ╚══════════════════════════════════╝")
+        try:
+            scelta = input(f"[ATM{my_id}] Scelta: ").strip()
+        except EOFError:
+            break
+        if scelta == "1":
+            balance = read_balance()
+            notify(my_id, f"💰 Saldo attuale: {balance}€")
+        elif scelta == "2":
+            try:
+                amount = int(input(f"[ATM{my_id}] Importo da depositare (€): ").strip())
+                if amount <= 0:
+                    notify(my_id, "❌ Importo non valido.")
+                    continue
+                pending_operations.put(("deposito", amount))
+                notify(my_id, f"⏳ Deposito {amount}€ accodato — verrà eseguito al prossimo token.")
+            except ValueError:
+                notify(my_id, "❌ Inserisci un numero intero valido.")
+        elif scelta == "3":
+            try:
+                amount = int(input(f"[ATM{my_id}] Importo da prelevare (€): ").strip())
+                if amount <= 0:
+                    notify(my_id, "❌ Importo non valido.")
+                    continue
+                pending_operations.put(("prelievo", amount))
+                notify(my_id, f"⏳ Prelievo {amount}€ accodato — verrà eseguito al prossimo token.")
+            except ValueError:
+                notify(my_id, "❌ Inserisci un numero intero valido.")
+        elif scelta == "4":
+            show_history(my_id)
+        elif scelta == "5":
+            notify(my_id, "👋 Uscita.")
+            os._exit(0)
+        else:
+            notify(my_id, "❌ Scelta non valida.")
+
+def start_server(my_id):
+    host, port = NODES[my_id]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(5)
+        log(my_id, f"Server avviato sulla porta {port}")
+        while running:
+            server.settimeout(1.0)
+            try:
+                conn, addr = server.accept()
+                with conn:
+                    data = conn.recv(1024).decode().strip()
+                    if data:
+                        threading.Thread(
+                            target=handle_message,
+                            args=(my_id, data),
+                            daemon=True
+                        ).start()
+            except socket.timeout:
+                continue
+
+def send_ready(my_id):
+    host, port = NODES[1]
+    for attempt in range(MAX_RETRIES):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(3)
+                s.connect((host, port))
+                s.sendall(f"READY:{my_id}".encode())
+            log(my_id, "READY inviato ad ATM1")
+            return True
+        except (ConnectionRefusedError, socket.timeout):
+            log(my_id, f"ATM1 non ancora pronto, riprovo... ({attempt+1}/{MAX_RETRIES})")
+            time.sleep(RETRY_DELAY)
+    log(my_id, "Impossibile contattare ATM1.")
+    return False
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or sys.argv[1] not in ["1", "2", "3", "4"]:
+        print("Uso: python atm.py <ID>   dove ID è 1, 2, 3 o 4")
+        sys.exit(1)
+    my_id = int(sys.argv[1])
+    successor_id = get_successor_id(my_id)
+    with open(f"atm{my_id}.log", "w") as f:
+        f.write(f"=== Sessione ATM{my_id} — {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} ===\n")
+    print(f"\n╔══════════════════════════════════════╗")
+    print(f"  ATM{my_id} avviato | Successore: ATM{successor_id}")
+    print(f"╚══════════════════════════════════════╝\n")
+    if my_id == 1:
+        init_balance(my_id)
+    threading.Thread(target=start_server, args=(my_id,), daemon=True).start()
+    if my_id != 1:
+        time.sleep(0.5)
+        def ready_and_wait():
+            ok = send_ready(my_id)
+            if not ok:
+                log(my_id, "Non ho raggiunto ATM1 — aspetto il primo token per sbloccarmi.")
+        threading.Thread(target=ready_and_wait, daemon=True).start()
+    else:
+        notify(my_id, "⏳ Aspetto che ATM2, ATM3 e ATM4 siano pronti...")
+        all_ready_event.wait()
+        time.sleep(0.3)
+        notify(my_id, "🚀 Lancio il token nell'anello!")
+        send_message(my_id, successor_id, "TOKEN:1")
+    threading.Thread(
+        target=user_menu,
+        args=(my_id, all_ready_event),
+        daemon=True
+    ).start()
+    while running:
+        time.sleep(0.5)
+    log(my_id, "Sistema terminato.")
