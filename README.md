@@ -9,10 +9,10 @@ Ogni nodo è un processo separato e comunica via TCP. Il saldo è condiviso via 
 Apri **4 terminali** nella cartella del progetto ed esegui:
 
 ```bash
-/usr/bin/python3 atm.py 1
-/usr/bin/python3 atm.py 2
-/usr/bin/python3 atm.py 3
-/usr/bin/python3 atm.py 4
+python3 atm.py 1
+python3 atm.py 2
+python3 atm.py 3
+python3 atm.py 4
 ```
 
 ## Sequenza richiesta (manuale)
