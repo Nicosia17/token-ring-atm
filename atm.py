@@ -111,10 +111,27 @@ tx_counter = 0
 tx_lock = threading.Lock()
 
 def execute_transaction(my_id):
+    """
+    Esegue una transazione bancaria SOLO se questo nodo possiede il token.
+
+    MUTUA ESCLUSIONE GARANTITA:
+    Questa funzione è chiamata ESCLUSIVAMENTE dal branch TOKEN in
+    handle_message(). Non esiste nessun altro percorso che acceda
+    a balance.txt → la mutua esclusione è strutturale.
+
+    ATOMICITÀ:
+    read → validate → compute → write avvengono in sequenza sincrona.
+    Nessun interleaving con altri nodi (il token è unico nel sistema).
+
+    RISORSA CONDIVISA — balance.txt:
+    Tutti e 4 i nodi leggono/scrivono lo stesso file su disco.
+    Nessuna variabile globale in memoria è condivisa tra i processi.
+    """
     global tx_counter
     # Sezione critica: viene eseguita solo quando il nodo possiede il token.
     # La mutua esclusione è garantita perché il token è unico nel sistema.
     if pending_operations.empty():
+        # Nessuna operazione → il token viene inoltrato immediatamente
         log(my_id, "Nessuna operazione in coda → passo il token.")
         return
     # Prelevo l'operazione accodata (FIFO).
@@ -122,7 +139,7 @@ def execute_transaction(my_id):
     with tx_lock:
         tx_counter += 1
         tx_id = f"TX-{tx_counter:03d}"
-    # Lettura del saldo PRIMA della modifica.
+    # Step 1: lettura dal file condiviso
     balance = read_balance()
     # Transazione atomica: lettura → validazione → aggiornamento → scrittura → log.
     log(my_id, f"══ INIZIO TRANSAZIONE {tx_id} ══")
@@ -130,19 +147,23 @@ def execute_transaction(my_id):
     log(my_id, f"ATM         : ATM{my_id}")
     log(my_id, f"Operazione  : {operation.upper()} di {amount}€")
     log(my_id, f"Saldo prima : {balance}€")
+    # Step 2: validazione
+    if operation == "prelievo" and amount > balance:
+        notify(my_id, f"❌ Saldo insufficiente ({balance}€). Annullata.")
+        log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
+        return
+
+    # Step 3: aggiornamento
     if operation == "prelievo":
-        # Validazione: il prelievo è consentito solo se il saldo è sufficiente.
-        if amount > balance:
-            notify(my_id, f"❌ [{tx_id}] Saldo insufficiente ({balance}€ disponibili). Operazione annullata.")
-            log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
-            return
         new_balance = balance - amount
     elif operation == "deposito":
         new_balance = balance + amount
     else:
         log(my_id, f"Operazione sconosciuta: {operation}. Annullata.")
         return
-    # Scrittura del nuovo saldo: punto critico della transazione.
+    # Step 4: scrittura sul file condiviso
+    # Il token viene passato DOPO questo punto → nessun altro nodo
+    # può leggere un saldo intermedio o inconsistente.
     write_balance(new_balance)
     log(my_id, f"Saldo dopo  : {new_balance}€")
     log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
@@ -160,31 +181,44 @@ def get_successor_id(my_id):
     return (my_id % 4) + 1
 
 def send_message(my_id, target_id, message):
-    # Scambio di messaggi: ogni nodo comunica solo con il suo successore.
-    # Le connessioni sono locali (localhost) e i messaggi sono testuali.
+    """
+    Invia un messaggio TCP al nodo target_id.
+
+    Topologia anello logico:
+      ATM1 (5001) → ATM2 (5002) → ATM3 (5003) → ATM4 (5004) → ATM1
+
+    Formato messaggi:
+      TOKEN:<round>  — il token con numero di round
+      READY:<id>     — segnale di disponibilità ad ATM1
+      STOP           — comando di arresto propagato nell'anello
+
+    Connessione TCP short-lived: una connessione per ogni messaggio.
+    Meccanismo di retry: MAX_RETRIES tentativi con RETRY_DELAY di attesa.
+    """
     host, port = NODES[target_id]
     for attempt in range(MAX_RETRIES):
         try:
-            # Connessione breve: apro socket, invio, chiudo.
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(3)
-                s.connect((host, port))
+                s.settimeout(3)           # timeout 3s
+                s.connect((host, port))   # TCP verso target_id
                 s.sendall(message.encode())
             log(my_id, f">> Inviato ad ATM{target_id}: '{message}'")
             return True
         except (ConnectionRefusedError, socket.timeout):
             if attempt < MAX_RETRIES - 1:
                 log(my_id, f"ATM{target_id} non risponde, riprovo ({attempt+1}/{MAX_RETRIES})...")
-                time.sleep(RETRY_DELAY)
+                time.sleep(RETRY_DELAY)   # attesa tra un tentativo e l'altro
     log(my_id, f"Impossibile raggiungere ATM{target_id} dopo {MAX_RETRIES} tentativi.")
     return False
 
 def handle_message(my_id, message):
     global running
-    # Messaggi gestiti:
-    # - READY:<id>  -> un nodo segnala che è pronto
-    # - TOKEN:<n>   -> il token arriva a questo nodo
-    # - STOP        -> richiesta di terminazione
+    # Dispatcher centrale per tutti i messaggi TCP in arrivo.
+    # Tre tipi di messaggio:
+    #   - READY:<id>    → nodo secondario segnala disponibilità ad ATM1
+    #   - TOKEN:<round> → questo nodo riceve il token (SEZIONE CRITICA)
+    #   - STOP          → arresto ordinato propagato nell'anello
+
     if message.startswith("READY"):
         # READY serve ad ATM1 per sapere che tutti i nodi sono online.
         _, sender_id = message.split(":")
@@ -202,6 +236,10 @@ def handle_message(my_id, message):
         # e poi lo inoltro al successore per mantenere l’anello attivo.
         if not all_ready_event.is_set():
             all_ready_event.set()
+        # ── INIZIO SEZIONE CRITICA ─────────────────────────────
+        # Questo nodo è ora l'UNICO proprietario del token.
+        # Può accedere in modo esclusivo a balance.txt.
+        # Nessun altro nodo può eseguire transazioni ora.
         # Blocco l'interfaccia mentre il token è in uso.
         token_busy.set()
         log(my_id, f"★ TOKEN RICEVUTO — round {round_num}")
@@ -210,12 +248,15 @@ def handle_message(my_id, message):
         # Sezione critica: eseguo al massimo una transazione per passaggio.
         execute_transaction(my_id)
         successor = get_successor_id(my_id)
+        # Il round incrementa solo quando il token completa
+        # un giro completo (quando lascia ATM4 verso ATM1)
         next_round = round_num + 1 if my_id == 4 else round_num
         # Piccola pausa per rendere visibile il passaggio del token.
         time.sleep(TOKEN_PAUSE)
         log(my_id, f">> Passo il token ad ATM{successor} (round {next_round})")
         token_busy.clear()
-        # Inoltro del token al successore nell'anello.
+        # ── FINE SEZIONE CRITICA ───────────────────────────────
+        # Inoltro token al successore → anello continua
         send_message(my_id, successor, f"TOKEN:{next_round}")
     elif message == "STOP":
         # STOP viene propagato per fermare tutti i nodi.
