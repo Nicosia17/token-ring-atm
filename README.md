@@ -42,7 +42,7 @@ Ogni nodo registra:
 
 I log sono in `atm1.log`, `atm2.log`, `atm3.log`, `atm4.log`.
 
-### Dove si vede nei log
+### Cosa si vede nei log
 
 - **Token ricevuto**: riga con `TOKEN RICEVUTO`
 - **Token inoltrato**: riga con `Passo il token`
