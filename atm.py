@@ -8,9 +8,11 @@ from datetime import datetime
 from config import (NODES, INITIAL_BALANCE, BALANCE_FILE,
                     RETRY_DELAY, MAX_RETRIES, TOKEN_PAUSE, SILENT_MODE)
 
+# Lock globale per evitare output interlacciati tra thread.
 log_lock = threading.Lock()
 
 def log(my_id, message):
+    # Log tecnico: serve per tracciare token, transazioni e debug.
     timestamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{timestamp}][ATM{my_id}] {message}"
     with open(f"atm{my_id}.log", "a") as f:
@@ -20,6 +22,7 @@ def log(my_id, message):
             print(line)
 
 def notify(my_id, message):
+    # Log utente: va sempre a terminale + file.
     timestamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{timestamp}][ATM{my_id}] {message}"
     with log_lock:
@@ -28,40 +31,48 @@ def notify(my_id, message):
         f.write(line + "\n")
 
 def init_balance(my_id):
+    # Il saldo è condiviso via file: ATM1 lo crea se non esiste.
     if not os.path.exists(BALANCE_FILE):
         with open(BALANCE_FILE, "w") as f:
             f.write(str(INITIAL_BALANCE))
         notify(my_id, f"💳 Saldo iniziale creato: {INITIAL_BALANCE}€")
 
 def read_balance():
+    # Lettura del saldo corrente dal file condiviso.
     with open(BALANCE_FILE, "r") as f:
         return int(f.read().strip())
 
 def write_balance(amount):
+    # Scrittura atomica del nuovo saldo sul file condiviso.
     with open(BALANCE_FILE, "w") as f:
         f.write(str(amount))
 
 def show_history(my_id):
+    # Ricostruisce lo storico leggendo il log dell'ATM locale.
     log_file = f"atm{my_id}.log"
     if not os.path.exists(log_file):
         notify(my_id, "Nessun log disponibile ancora.")
         return
     with open(log_file, "r") as f:
         lines = f.readlines()
+    # Ogni transazione è un blocco tra INIZIO/FINE TRANSAZIONE.
     transazioni = []
     blocco_corrente = None
     for line in lines:
         line = line.strip()
-        if "INIZIO TRANSAZIONE" in line:
+    # Individuo l'inizio di un nuovo blocco transazione.
+    if "INIZIO TRANSAZIONE" in line:
             try:
                 tx_id = line.split("INIZIO TRANSAZIONE")[1].strip().replace("══", "").strip()
             except:
                 tx_id = "TX-???"
             blocco_corrente = {"id": tx_id, "atm": f"ATM{my_id}", "lines": []}
-        elif "FINE TRANSAZIONE" in line and blocco_corrente is not None:
+    # Quando arrivo alla fine, salvo il blocco.
+    elif "FINE TRANSAZIONE" in line and blocco_corrente is not None:
             transazioni.append(blocco_corrente)
             blocco_corrente = None
-        elif blocco_corrente is not None:
+    # Raccatto solo le righe interessanti per il riepilogo.
+    elif blocco_corrente is not None:
             keywords = ["ATM", "Operazione", "Saldo prima", "Saldo dopo", "insufficiente"]
             if any(k in line for k in keywords):
                 try:
@@ -69,6 +80,7 @@ def show_history(my_id):
                 except:
                     content = line
                 blocco_corrente["lines"].append(content)
+    # Passaggi del token senza operazioni: utili per capire il flusso.
     passaggi_vuoti = [l.strip() for l in lines if "Nessuna operazione in coda" in l]
     with log_lock:
         print(f"\n  ╔══════════════════════════════════════════════╗")
@@ -91,27 +103,35 @@ def show_history(my_id):
         print(f"  ╚══════════════════════════════════════════════╝")
 
 pending_operations = queue.Queue()
+# Event usato per bloccare il menu quando il token è in esecuzione.
 token_busy = threading.Event()
 
 tx_counter = 0
+# Lock per incrementare il contatore transazioni in modo sicuro.
 tx_lock = threading.Lock()
 
 def execute_transaction(my_id):
     global tx_counter
+    # Sezione critica: viene eseguita solo quando il nodo possiede il token.
+    # La mutua esclusione è garantita perché il token è unico nel sistema.
     if pending_operations.empty():
         log(my_id, "Nessuna operazione in coda → passo il token.")
         return
+    # Prelevo l'operazione accodata (FIFO).
     operation, amount = pending_operations.get()
     with tx_lock:
         tx_counter += 1
         tx_id = f"TX-{tx_counter:03d}"
+    # Lettura del saldo PRIMA della modifica.
     balance = read_balance()
+    # Transazione atomica: lettura → validazione → aggiornamento → scrittura → log.
     log(my_id, f"══ INIZIO TRANSAZIONE {tx_id} ══")
     log(my_id, f"ID          : {tx_id}")
     log(my_id, f"ATM         : ATM{my_id}")
     log(my_id, f"Operazione  : {operation.upper()} di {amount}€")
     log(my_id, f"Saldo prima : {balance}€")
     if operation == "prelievo":
+        # Validazione: il prelievo è consentito solo se il saldo è sufficiente.
         if amount > balance:
             notify(my_id, f"❌ [{tx_id}] Saldo insufficiente ({balance}€ disponibili). Operazione annullata.")
             log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
@@ -122,23 +142,30 @@ def execute_transaction(my_id):
     else:
         log(my_id, f"Operazione sconosciuta: {operation}. Annullata.")
         return
+    # Scrittura del nuovo saldo: punto critico della transazione.
     write_balance(new_balance)
     log(my_id, f"Saldo dopo  : {new_balance}€")
     log(my_id, f"══ FINE TRANSAZIONE {tx_id} ══")
     notify(my_id, f"✅ [{tx_id}] {operation.upper()} di {amount}€ su ATM{my_id} completato! Nuovo saldo: {new_balance}€")
 
 running = True
+# Set usato da ATM1 per sapere quando tutti i nodi sono operativi.
 ready_nodes = set()
 ready_lock = threading.Lock()
+# Event che sblocca i menu quando il sistema è pronto.
 all_ready_event = threading.Event()
 
 def get_successor_id(my_id):
+    # Successore nell'anello logico (1→2→3→4→1).
     return (my_id % 4) + 1
 
 def send_message(my_id, target_id, message):
+    # Scambio di messaggi: ogni nodo comunica solo con il suo successore.
+    # Le connessioni sono locali (localhost) e i messaggi sono testuali.
     host, port = NODES[target_id]
     for attempt in range(MAX_RETRIES):
         try:
+            # Connessione breve: apro socket, invio, chiudo.
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(3)
                 s.connect((host, port))
@@ -154,7 +181,12 @@ def send_message(my_id, target_id, message):
 
 def handle_message(my_id, message):
     global running
+    # Messaggi gestiti:
+    # - READY:<id>  -> un nodo segnala che è pronto
+    # - TOKEN:<n>   -> il token arriva a questo nodo
+    # - STOP        -> richiesta di terminazione
     if message.startswith("READY"):
+        # READY serve ad ATM1 per sapere che tutti i nodi sono online.
         _, sender_id = message.split(":")
         sender_id = int(sender_id)
         with ready_lock:
@@ -166,20 +198,27 @@ def handle_message(my_id, message):
     elif message.startswith("TOKEN"):
         _, round_num = message.split(":")
         round_num = int(round_num)
+        # Gestione del token: quando arriva, entro in sezione critica
+        # e poi lo inoltro al successore per mantenere l’anello attivo.
         if not all_ready_event.is_set():
             all_ready_event.set()
+        # Blocco l'interfaccia mentre il token è in uso.
         token_busy.set()
         log(my_id, f"★ TOKEN RICEVUTO — round {round_num}")
         if not pending_operations.empty():
             notify(my_id, "🔑 Token ricevuto — eseguo la tua operazione...")
+        # Sezione critica: eseguo al massimo una transazione per passaggio.
         execute_transaction(my_id)
         successor = get_successor_id(my_id)
         next_round = round_num + 1 if my_id == 4 else round_num
+        # Piccola pausa per rendere visibile il passaggio del token.
         time.sleep(TOKEN_PAUSE)
         log(my_id, f">> Passo il token ad ATM{successor} (round {next_round})")
         token_busy.clear()
+        # Inoltro del token al successore nell'anello.
         send_message(my_id, successor, f"TOKEN:{next_round}")
     elif message == "STOP":
+        # STOP viene propagato per fermare tutti i nodi.
         log(my_id, "STOP ricevuto — il sistema si ferma.")
         notify(my_id, "🛑 Sistema fermato.")
         running = False
@@ -189,10 +228,12 @@ def handle_message(my_id, message):
             send_message(my_id, successor, "STOP")
 
 def user_menu(my_id, ready_event):
+    # Il menu si attiva solo quando il sistema è operativo.
     ready_event.wait()
     time.sleep(1.0)
     notify(my_id, "✅ Sistema pronto! Puoi operare.")
     while running:
+        # Se il token è in uso, evito input concorrenti.
         while token_busy.is_set():
             time.sleep(0.1)
         with log_lock:
@@ -210,6 +251,7 @@ def user_menu(my_id, ready_event):
         except EOFError:
             break
         if scelta == "1":
+            # Lettura saldo: non modifica la risorsa condivisa.
             balance = read_balance()
             notify(my_id, f"💰 Saldo attuale: {balance}€")
         elif scelta == "2":
@@ -218,6 +260,7 @@ def user_menu(my_id, ready_event):
                 if amount <= 0:
                     notify(my_id, "❌ Importo non valido.")
                     continue
+                # Accodo l'operazione: verrà eseguita al prossimo token.
                 pending_operations.put(("deposito", amount))
                 notify(my_id, f"⏳ Deposito {amount}€ accodato — verrà eseguito al prossimo token.")
             except ValueError:
@@ -228,6 +271,7 @@ def user_menu(my_id, ready_event):
                 if amount <= 0:
                     notify(my_id, "❌ Importo non valido.")
                     continue
+                # Accodo l'operazione: verrà eseguita al prossimo token.
                 pending_operations.put(("prelievo", amount))
                 notify(my_id, f"⏳ Prelievo {amount}€ accodato — verrà eseguito al prossimo token.")
             except ValueError:
@@ -241,6 +285,7 @@ def user_menu(my_id, ready_event):
             notify(my_id, "❌ Scelta non valida.")
 
 def start_server(my_id):
+    # Server TCP locale che riceve READY/TOKEN/STOP.
     host, port = NODES[my_id]
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -263,6 +308,7 @@ def start_server(my_id):
                 continue
 
 def send_ready(my_id):
+    # ATM2/3/4 avvisano ATM1 di essere online.
     host, port = NODES[1]
     for attempt in range(MAX_RETRIES):
         try:
@@ -284,15 +330,18 @@ if __name__ == "__main__":
         sys.exit(1)
     my_id = int(sys.argv[1])
     successor_id = get_successor_id(my_id)
+    # Pulizia del log per una sessione ordinata.
     with open(f"atm{my_id}.log", "w") as f:
         f.write(f"=== Sessione ATM{my_id} — {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} ===\n")
     print(f"\n╔══════════════════════════════════════╗")
     print(f"  ATM{my_id} avviato | Successore: ATM{successor_id}")
     print(f"╚══════════════════════════════════════╝\n")
     if my_id == 1:
+        # Solo ATM1 inizializza il saldo.
         init_balance(my_id)
     threading.Thread(target=start_server, args=(my_id,), daemon=True).start()
     if my_id != 1:
+        # ATM2/3/4 inviano READY e poi attendono il primo TOKEN.
         time.sleep(0.5)
         def ready_and_wait():
             ok = send_ready(my_id)
@@ -300,6 +349,7 @@ if __name__ == "__main__":
                 log(my_id, "Non ho raggiunto ATM1 — aspetto il primo token per sbloccarmi.")
         threading.Thread(target=ready_and_wait, daemon=True).start()
     else:
+        # ATM1 aspetta tutti i READY e poi immette il token nell'anello.
         notify(my_id, "⏳ Aspetto che ATM2, ATM3 e ATM4 siano pronti...")
         all_ready_event.wait()
         time.sleep(0.3)
