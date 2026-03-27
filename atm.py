@@ -60,19 +60,19 @@ def show_history(my_id):
     blocco_corrente = None
     for line in lines:
         line = line.strip()
-    # Individuo l'inizio di un nuovo blocco transazione.
-    if "INIZIO TRANSAZIONE" in line:
+        # Individuo l'inizio di un nuovo blocco transazione.
+        if "INIZIO TRANSAZIONE" in line:
             try:
                 tx_id = line.split("INIZIO TRANSAZIONE")[1].strip().replace("══", "").strip()
             except:
                 tx_id = "TX-???"
             blocco_corrente = {"id": tx_id, "atm": f"ATM{my_id}", "lines": []}
-    # Quando arrivo alla fine, salvo il blocco.
-    elif "FINE TRANSAZIONE" in line and blocco_corrente is not None:
+        # Quando arrivo alla fine, salvo il blocco.
+        elif "FINE TRANSAZIONE" in line and blocco_corrente is not None:
             transazioni.append(blocco_corrente)
             blocco_corrente = None
-    # Raccatto solo le righe interessanti per il riepilogo.
-    elif blocco_corrente is not None:
+        # Raccatto solo le righe interessanti per il riepilogo.
+        elif blocco_corrente is not None:
             keywords = ["ATM", "Operazione", "Saldo prima", "Saldo dopo", "insufficiente"]
             if any(k in line for k in keywords):
                 try:
@@ -243,6 +243,7 @@ def handle_message(my_id, message):
         # Blocco l'interfaccia mentre il token è in uso.
         token_busy.set()
         log(my_id, f"★ TOKEN RICEVUTO — round {round_num}")
+        notify(my_id, f"🔄 Token ricevuto (round {round_num})")
         if not pending_operations.empty():
             notify(my_id, "🔑 Token ricevuto — eseguo la tua operazione...")
         # Sezione critica: eseguo al massimo una transazione per passaggio.
@@ -255,6 +256,7 @@ def handle_message(my_id, message):
         time.sleep(TOKEN_PAUSE)
         log(my_id, f">> Passo il token ad ATM{successor} (round {next_round})")
         token_busy.clear()
+        notify(my_id, f"➡️ Token inoltrato ad ATM{successor} (round {next_round})")
         # ── FINE SEZIONE CRITICA ───────────────────────────────
         # Inoltro token al successore → anello continua
         send_message(my_id, successor, f"TOKEN:{next_round}")
